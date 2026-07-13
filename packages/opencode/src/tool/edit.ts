@@ -18,6 +18,7 @@ import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
+import * as Hashline from "./hashline"
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -44,14 +45,195 @@ function lock(filePath: string) {
   return next
 }
 
+interface HashlineOpInput {
+  ref?: string
+  startRef?: string
+  endRef?: string
+  content?: string
+}
+
+interface ResolvedOp {
+  startIndex: number
+  endIndex: number
+  insertLines: string[]
+  label: string
+}
+
+function buildOperations(params: {
+  operations?: ReadonlyArray<HashlineOpInput>
+  ref?: string
+  startRef?: string
+  endRef?: string
+  content?: string
+}): HashlineOpInput[] {
+  if (params.operations && params.operations.length > 0) {
+    return params.operations.map((op) => ({
+      ref: op.ref,
+      startRef: op.startRef,
+      endRef: op.endRef,
+      content: op.content,
+    }))
+  }
+  return [{ ref: params.ref, startRef: params.startRef, endRef: params.endRef, content: params.content }]
+}
+
+function resolveRefIndex(
+  ref: string,
+  lines: string[],
+  hashLength: number,
+  safeReapply: boolean,
+): number {
+  const parsed = Hashline.parseRef(ref)
+  if (parsed.lineNumber > lines.length) {
+    throw new Error(
+      `Reference ${ref} points to line ${parsed.lineNumber}, but file only has ${lines.length} lines. Read the file again.`,
+    )
+  }
+
+  const index = parsed.lineNumber - 1
+  const actualLine = lines[index]
+  const actualHash = Hashline.lineHash(actualLine, hashLength)
+  const actualAnchor = Hashline.anchorHash(lines[index - 1], actualLine, lines[index + 1], hashLength)
+
+  if (actualHash !== parsed.hash || (parsed.anchor && actualAnchor !== parsed.anchor)) {
+    if (safeReapply) {
+      const candidates = findRefCandidates(parsed, lines, hashLength)
+      if (candidates.length === 1) return candidates[0]
+      if (candidates.length > 1) {
+        throw new Error(
+          `Hash mismatch for line ${parsed.lineNumber}; found multiple candidates (lines ${candidates.map((c) => c + 1).join(", ")}). Read the file again.`,
+        )
+      }
+      throw new Error(`Hash mismatch for line ${parsed.lineNumber}; no candidates found. Read the file again.`)
+    }
+
+    const expected = parsed.anchor
+      ? `${parsed.lineNumber}#${parsed.hash}#${parsed.anchor}`
+      : `${parsed.lineNumber}#${parsed.hash}`
+    const actual = `${parsed.lineNumber}#${actualHash}#${actualAnchor}`
+    throw new Error(`Hash mismatch for line ${parsed.lineNumber}. Expected ${expected}, actual ${actual}. Read the file again.`)
+  }
+
+  return index
+}
+
+function findRefCandidates(parsed: Hashline.ParsedRef, lines: string[], hashLength: number): number[] {
+  const candidates: number[] = []
+  for (let idx = 0; idx < lines.length; idx++) {
+    if (Hashline.lineHash(lines[idx], hashLength) !== parsed.hash) continue
+    if (parsed.anchor && Hashline.anchorHash(lines[idx - 1], lines[idx], lines[idx + 1], hashLength) !== parsed.anchor)
+      continue
+    candidates.push(idx)
+  }
+  return candidates
+}
+
+function resolveOperation(
+  op: HashlineOpInput,
+  lines: string[],
+  hashLength: number,
+  safeReapply: boolean,
+): ResolvedOp {
+  if (op.ref && op.startRef) {
+    throw new Error("Use either ref or startRef/endRef, not both")
+  }
+
+  const baseRef = op.startRef ?? op.ref
+  if (!baseRef) throw new Error("Operation requires ref or startRef")
+  if (op.content === undefined) throw new Error("Operation requires content")
+
+  const startIndex = resolveRefIndex(baseRef, lines, hashLength, safeReapply)
+  const endIndex = op.endRef ? resolveRefIndex(op.endRef, lines, hashLength, safeReapply) : startIndex
+
+  const start = Math.min(startIndex, endIndex)
+  const end = Math.max(startIndex, endIndex)
+
+  return {
+    startIndex: start,
+    endIndex: end,
+    insertLines: Hashline.splitContentToLines(Hashline.stripHashlineContent(op.content)),
+    label: `${baseRef}..${op.endRef ?? baseRef}`,
+  }
+}
+
+function validateNoOverlap(ops: ResolvedOp[]): void {
+  const consumed = new Set<number>()
+  for (const op of ops) {
+    for (let i = op.startIndex; i <= op.endIndex; i++) {
+      if (consumed.has(i)) {
+        throw new Error(`Overlapping operations: ${op.label} conflicts with a previous operation`)
+      }
+      consumed.add(i)
+    }
+  }
+}
+
+function applyHashlineChanges(
+  lines: string[],
+  ops: ResolvedOp[],
+): { lines: string[]; additions: number; deletions: number } {
+  const sorted = [...ops].sort((a, b) => b.startIndex - a.startIndex)
+  const nextLines = [...lines]
+  let additions = 0
+  let deletions = 0
+  for (const op of sorted) {
+    additions += op.insertLines.length
+    deletions += op.endIndex - op.startIndex + 1
+    nextLines.splice(op.startIndex, op.endIndex - op.startIndex + 1, ...op.insertLines)
+  }
+  return { lines: nextLines, additions, deletions }
+}
+
+const Operation = Schema.Struct({
+  op: Schema.optional(Schema.Literals(["replace", "replace_range"])).annotate({
+    description: "Operation type. 'replace' replaces the line(s) identified by ref or startRef/endRef with content.",
+  }),
+  ref: Schema.optional(Schema.String).annotate({
+    description: "Single-line ref from Read output, e.g. '3#A0C#393'. Replaces just that line.",
+  }),
+  startRef: Schema.optional(Schema.String).annotate({
+    description: "Start ref for a multi-line range. Must be used with endRef.",
+  }),
+  endRef: Schema.optional(Schema.String).annotate({
+    description: "End ref for a multi-line range. Must be used with startRef.",
+  }),
+  content: Schema.optional(Schema.String).annotate({
+    description: "Replacement text for this operation.",
+  }),
+})
+
 export const Parameters = Schema.Struct({
   filePath: Schema.String.annotate({ description: "The absolute path to the file to modify" }),
-  oldString: Schema.String.annotate({ description: "The text to replace" }),
-  newString: Schema.String.annotate({
-    description: "The text to replace it with (must be different from oldString)",
+  content: Schema.optional(Schema.String).annotate({
+    description: "Replacement text when using ref or startRef-based edits.",
+  }),
+  ref: Schema.optional(Schema.String).annotate({
+    description:
+      "Single-line ref from Read output, e.g. '3#A0C#393'. Validates target line content before replacing.",
+  }),
+  startRef: Schema.optional(Schema.String).annotate({
+    description: "Start ref from Read output. Validates target line content before replacing.",
+  }),
+  endRef: Schema.optional(Schema.String).annotate({
+    description: "End ref for multi-line range replacement. Only used with startRef.",
+  }),
+  fileRev: Schema.optional(Schema.String).annotate({
+    description: "REV token from Read output, e.g. '2ED9E6A9'. When set, edit fails if file hash mismatch.",
+  }),
+  safeReapply: Schema.optional(Schema.Boolean).annotate({
+    description: "If true and hash mismatch, reapplies with refs adjusted to new context.",
+  }),
+  operations: Schema.optional(Schema.Array(Operation)).annotate({
+    description: "Batch multiple same-file edits. Each entry has op, ref/startRef/endRef, and content.",
+  }),
+  oldString: Schema.optional(Schema.String).annotate({
+    description: "The text to replace (legacy path). Prefer ref/startRef with content when possible.",
+  }),
+  newString: Schema.optional(Schema.String).annotate({
+    description: "The text to replace it with (must be different from oldString).",
   }),
   replaceAll: Schema.optional(Schema.Boolean).annotate({
-    description: "Replace all occurrences of oldString (default false)",
+    description: "Replace all occurrences of oldString (default false, legacy path).",
   }),
 })
 
@@ -72,7 +254,8 @@ export const EditTool = Tool.define(
             throw new Error("filePath is required")
           }
 
-          if (params.oldString === params.newString) {
+          const isHashline = Boolean(params.ref || params.startRef || params.operations)
+          if (!isHashline && params.oldString === params.newString) {
             throw new Error("No changes to apply: oldString and newString are identical.")
           }
 
@@ -85,53 +268,73 @@ export const EditTool = Tool.define(
           let diff = ""
           let contentOld = ""
           let contentNew = ""
+          let isNewFile = false
+
           yield* lock(filePath).withPermits(1)(
             Effect.gen(function* () {
-              if (params.oldString === "") {
+              let sourceBom = false
+
+              if (isHashline) {
+                const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                if (!info) throw new Error(`File ${filePath} not found`)
+                if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+
+                const source = yield* Bom.readFile(afs, filePath)
+                sourceBom = source.bom
+                contentOld = source.text
+
+                const parsed = Hashline.parseFile(contentOld)
+                const hashLength = Hashline.adaptiveHashLength(parsed.lines.length)
+
+                if (params.fileRev) {
+                  const actualRev = Hashline.computeFileRev(contentOld)
+                  if (actualRev !== params.fileRev.toUpperCase()) {
+                    throw new Error(
+                      `File revision mismatch for ${filePath}. Expected ${params.fileRev.toUpperCase()}, actual ${actualRev}. Read the file again before editing.`,
+                    )
+                  }
+                }
+
+                const ops = buildOperations(params)
+                const resolved = ops.map((op) =>
+                  resolveOperation(op, parsed.lines, hashLength, Boolean(params.safeReapply)),
+                )
+                validateNoOverlap(resolved)
+
+                const result = applyHashlineChanges(parsed.lines, resolved)
+                contentNew = Hashline.stringifyLines({
+                  lines: result.lines,
+                  eol: parsed.eol,
+                  endsWithNewline: parsed.endsWithNewline,
+                })
+              } else if (params.oldString === "") {
+                isNewFile = true
                 const existed = yield* afs.existsSafe(filePath)
                 if (existed) {
                   throw new Error(
                     "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
                   )
                 }
-                const next = Bom.split(params.newString)
-                const desiredBom = next.bom
                 contentOld = ""
-                contentNew = next.text
-                diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-                yield* ctx.ask({
-                  permission: "edit",
-                  patterns: [path.relative(instance.worktree, filePath)],
-                  always: ["*"],
-                  metadata: {
-                    filepath: filePath,
-                    diff,
-                  },
-                })
-                yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
-                if (yield* format.file(filePath)) {
-                  contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
-                }
-                yield* events.publish(FileSystem.Event.Edited, { file: filePath })
-                yield* events.publish(Watcher.Event.Updated, {
-                  file: filePath,
-                  event: "add",
-                })
-                return
+                contentNew = params.newString ?? ""
+              } else {
+                const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                if (!info) throw new Error(`File ${filePath} not found`)
+                if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+
+                const source = yield* Bom.readFile(afs, filePath)
+                sourceBom = source.bom
+                contentOld = source.text
+
+                const ending = detectLineEnding(contentOld)
+                const old = convertToLineEnding(normalizeLineEndings(params.oldString ?? ""), ending)
+                const replacement = convertToLineEnding(normalizeLineEndings(params.newString ?? ""), ending)
+
+                contentNew = replace(contentOld, old, replacement, params.replaceAll)
               }
 
-              const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              if (!info) throw new Error(`File ${filePath} not found`)
-              if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
-              const source = yield* Bom.readFile(afs, filePath)
-              contentOld = source.text
-
-              const ending = detectLineEnding(contentOld)
-              const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
-              const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
-
-              const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
-              const desiredBom = source.bom || next.bom
+              const next = Bom.split(contentNew)
+              const desiredBom = sourceBom || next.bom
               contentNew = next.text
 
               diff = trimDiff(
@@ -159,7 +362,7 @@ export const EditTool = Tool.define(
               yield* events.publish(FileSystem.Event.Edited, { file: filePath })
               yield* events.publish(Watcher.Event.Updated, {
                 file: filePath,
-                event: "change",
+                event: isNewFile ? "add" : "change",
               })
               diff = trimDiff(
                 createTwoFilesPatch(

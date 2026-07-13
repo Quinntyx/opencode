@@ -1,4 +1,4 @@
-import { Effect, Option, Schema, Scope, Stream } from "effect"
+import { Effect, Option, Schema, Scope } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as path from "path"
 import * as Tool from "./tool"
@@ -9,6 +9,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import * as Hashline from "./hashline"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -18,7 +19,6 @@ const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
-class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 
 // `offset` and `limit` were originally `z.coerce.number()` — the runtime
 // coercion was useful when the tool was called from a shell but serves no
@@ -134,50 +134,6 @@ export const ReadTool = Tool.define<
       )
     })
 
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
-      const start = opts.offset - 1
-      const raw: string[] = []
-      const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
-
-      // Note: prefer manual TextDecoder over Stream.decodeText — when the source stream
-      // ends without flushing, decodeText drops the final unterminated line. We also
-      // avoid Stream.runForEachWhile (it currently swallows the final unterminated
-      // line of the upstream splitLines pipeline) and use a tagged error to stop the
-      // upstream file stream as soon as the byte cap is reached.
-      const decoder = new TextDecoder("utf-8")
-      yield* fs.stream(filepath).pipe(
-        Stream.map((bytes) => decoder.decode(bytes, { stream: true })),
-        Stream.splitLines,
-        Stream.runForEach((text) =>
-          Effect.gen(function* () {
-            if (flags.done) return yield* new ReadStop()
-            flags.count += 1
-            if (flags.count <= start) return
-
-            if (raw.length >= opts.limit) {
-              flags.more = true
-              return
-            }
-
-            const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-            if (flags.bytes + size <= MAX_BYTES) {
-              raw.push(line)
-              flags.bytes += size
-              return
-            }
-
-            flags.cut = true
-            flags.more = true
-            flags.done = true
-            return yield* new ReadStop()
-          }),
-        ),
-        Effect.catchTag("ReadStop", () => Effect.void),
-      )
-
-      return { raw, count: flags.count, cut: flags.cut, more: flags.more, offset: opts.offset }
-    })
 
     const isBinaryFile = (filepath: string, bytes: Uint8Array) => {
       const ext = path.extname(filepath).toLowerCase()
@@ -328,25 +284,64 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
-      if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
+      const rawContent = yield* fs.readFileString(filepath)
+      const parsed = Hashline.parseFile(rawContent)
+      const totalLines = parsed.lines.length
+      const hashLength = Hashline.adaptiveHashLength(totalLines)
+      const rev = Hashline.computeFileRev(rawContent)
+
+      const offset = params.offset || 1
+      const limit = params.limit ?? DEFAULT_READ_LIMIT
+      const startIdx = offset - 1
+      const endIdx = Math.min(totalLines, startIdx + limit)
+
+      if (totalLines > 0 && startIdx >= totalLines && !(totalLines === 0 && offset === 1)) {
         return yield* Effect.fail(
-          new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
+          new Error(`Offset ${offset} is out of range for this file (${totalLines} lines)`),
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
-      output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
+      const body: string[] = [`${Hashline.PREFIX} REV:${rev}`]
+      const visibleRaw: string[] = []
+      let byteCount = Buffer.byteLength(body[0], "utf-8") + 1
+      let visibleEnd = startIdx
+      let cut = false
 
-      const last = file.offset + file.raw.length - 1
-      const next = last + 1
-      const truncated = file.more || file.cut
-      if (file.cut) {
-        output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${file.offset}-${last}. Use offset=${next} to continue.)`
-      } else if (file.more) {
-        output += `\n\n(Showing lines ${file.offset}-${last} of ${file.count}. Use offset=${next} to continue.)`
+      for (let idx = startIdx; idx < endIdx; idx++) {
+        const line = parsed.lines[idx]
+        visibleRaw.push(line)
+        const display =
+          line.length > MAX_LINE_LENGTH ? line.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : line
+        const lh = Hashline.lineHash(line, hashLength)
+        const ah = Hashline.anchorHash(parsed.lines[idx - 1], line, parsed.lines[idx + 1], hashLength)
+        const entry = `${Hashline.PREFIX} ${idx + 1}#${lh}#${ah}|${display}`
+        const entryBytes = Buffer.byteLength(entry, "utf-8") + 1
+
+        if (byteCount + entryBytes > MAX_BYTES) {
+          cut = true
+          break
+        }
+
+        body.push(entry)
+        byteCount += entryBytes
+        visibleEnd = idx + 1
+      }
+
+      const visibleCount = visibleEnd - startIdx
+      const lastShown = visibleCount > 0 ? visibleEnd : offset
+      const nextOffset = visibleEnd + 1
+      const more = visibleEnd < totalLines
+      const truncated = cut || more
+
+      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      output += body.join("\n")
+
+      if (cut) {
+        output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${offset}-${lastShown}. Use offset=${nextOffset} to continue.)`
+      } else if (more) {
+        output += `\n\n(Showing lines ${offset}-${lastShown} of ${totalLines}. Use offset=${nextOffset} to continue.)`
       } else {
-        output += `\n\n(End of file - total ${file.count} lines)`
+        output += `\n\n(End of file - total ${totalLines} lines)`
       }
       output += "\n</content>"
 
@@ -360,16 +355,16 @@ export const ReadTool = Tool.define<
         title,
         output,
         metadata: {
-          preview: file.raw.slice(0, 20).join("\n"),
+          preview: visibleRaw.slice(0, 20).join("\n"),
           truncated,
           loaded: loaded.map((item) => item.filepath),
           display: {
             type: "file" as const,
             path: filepath,
-            text: file.raw.join("\n"),
-            lineStart: file.offset,
-            lineEnd: last,
-            totalLines: file.count,
+            text: visibleRaw.join("\n"),
+            lineStart: offset,
+            lineEnd: Math.max(offset, lastShown),
+            totalLines,
             truncated,
           },
         },
