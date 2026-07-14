@@ -224,25 +224,6 @@ export const layer = Layer.effect(
         yield* migrateProjectId(ProjectV2.ID.make(data.previous), ProjectV2.ID.make(data.baseId))
       }
 
-      // Split sessions from repo-level project to this worktree (scoped by directory)
-      if (data.baseId && data.baseId !== projectID) {
-        const baseProjectID = ProjectV2.ID.make(data.baseId)
-        yield* db
-          .update(SessionTable)
-          .set({ project_id: projectID, time_updated: sql`${SessionTable.time_updated}` })
-          .where(
-            and(
-              eq(SessionTable.project_id, baseProjectID),
-              or(
-                eq(SessionTable.directory, data.directory),
-                like(SessionTable.directory, `${data.directory}/%`),
-              ),
-            ),
-          )
-          .run()
-          .pipe(Effect.orDie)
-      }
-
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
         ? fromRow(row)
@@ -311,6 +292,25 @@ export const layer = Layer.effect(
         })
         .run()
         .pipe(Effect.orDie)
+
+      // Split sessions from repo-level project to this worktree (scoped by directory)
+      if (data.baseId && data.baseId !== projectID) {
+        const baseProjectID = ProjectV2.ID.make(data.baseId)
+        yield* db
+          .update(SessionTable)
+          .set({ project_id: projectID, time_updated: sql`${SessionTable.time_updated}` })
+          .where(
+            and(
+              eq(SessionTable.project_id, baseProjectID),
+              or(
+                eq(SessionTable.directory, data.directory),
+                like(SessionTable.directory, `${data.directory}/%`),
+              ),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+      }
 
       if (projectID !== ProjectV2.ID.global) {
         yield* db
