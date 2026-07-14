@@ -19,6 +19,7 @@ export function Dialog(
   const renderer = useRenderer()
 
   let dismiss = false
+  let overlayMouseDown = false
   const width = () => {
     if (props.size === "xlarge") return 116
     if (props.size === "large") return 88
@@ -28,9 +29,15 @@ export function Dialog(
   return (
     <box
       onMouseDown={() => {
+        overlayMouseDown = true
         dismiss = !!renderer.getSelection()
       }}
       onMouseUp={() => {
+        if (!overlayMouseDown) {
+          overlayMouseDown = false
+          return
+        }
+        overlayMouseDown = false
         if (dismiss) {
           dismiss = false
           return
@@ -54,7 +61,7 @@ export function Dialog(
         }}
         width={width()}
         maxWidth={dimensions().width - 2}
-        backgroundColor={theme.backgroundPanel}
+        backgroundColor={theme.background}
         paddingTop={1}
       >
         {props.children}
