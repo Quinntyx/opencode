@@ -56,6 +56,7 @@ import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
+import { parseEditHashlines } from "../../util/edit-hashline"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
 import { Toast, useToast } from "../../ui/toast"
@@ -2327,41 +2328,30 @@ function Edit(props: ToolProps) {
   const { theme, syntax } = useTheme()
   const pathFormatter = usePathFormatter()
 
-  const view = createMemo(() => {
-    const diffStyle = ctx.tui.diff_style
-    if (diffStyle === "stacked") return "unified"
-    // Default to "auto" behavior
-    return ctx.width > 120 ? "split" : "unified"
-  })
-
-  const ft = createMemo(() => filetype(stringValue(props.input.filePath)))
-
   const diffContent = createMemo(() => stringValue(props.metadata.diff) ?? "")
+  const hashlines = createMemo(() => parseEditHashlines(diffContent()))
 
   return (
     <Switch>
       <Match when={stringValue(props.metadata.diff) !== undefined}>
         <BlockTool title={"← Edit " + pathFormatter.format(stringValue(props.input.filePath))} part={props.part}>
           <box paddingLeft={1}>
-            <diff
-              diff={diffContent()}
-              view={view()}
-              filetype={ft()}
-              syntaxStyle={syntax()}
-              showLineNumbers={true}
-              width="100%"
-              wrapMode={ctx.diffWrapMode()}
-              fg={theme.text}
-              addedBg={theme.diffAddedBg}
-              removedBg={theme.diffRemovedBg}
-              contextBg={theme.diffContextBg}
-              addedSignColor={theme.diffHighlightAdded}
-              removedSignColor={theme.diffHighlightRemoved}
-              lineNumberFg={theme.diffLineNumber}
-              lineNumberBg={theme.diffContextBg}
-              addedLineNumberBg={theme.diffAddedLineNumberBg}
-              removedLineNumberBg={theme.diffRemovedLineNumberBg}
-            />
+            <line_number
+              fg={theme.diffLineNumber}
+              minWidth={3}
+              paddingRight={1}
+              lineNumbers={hashlines().lineNumbers}
+              hideLineNumbers={hashlines().hideRows}
+              lineSigns={hashlines().lineSigns}
+            >
+              <code
+                conceal={false}
+                fg={theme.text}
+                filetype="diff"
+                syntaxStyle={syntax()}
+                content={diffContent()}
+              />
+            </line_number>
           </box>
           <Diagnostics diagnostics={props.metadata.diagnostics} filePath={stringValue(props.input.filePath) ?? ""} />
         </BlockTool>
