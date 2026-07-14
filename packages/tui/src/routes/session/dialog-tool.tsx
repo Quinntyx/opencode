@@ -1,6 +1,6 @@
-import { createMemo, onMount } from "solid-js"
+import { createMemo, onMount, Show } from "solid-js"
 import { TextAttributes } from "@opentui/core"
-import { useTerminalDimensions } from "@opentui/solid"
+import { useTerminalDimensions, useRenderer } from "@opentui/solid"
 import { useDialog } from "../../ui/dialog"
 import { DialogSelect } from "../../ui/dialog-select"
 import { useClipboard } from "../../context/clipboard"
@@ -41,7 +41,7 @@ export function DialogTool(props: { part: ToolPart }) {
           value: "tool.inspect",
           description: "raw tool call + result JSON",
           onSelect: (dialog) => {
-            dialog.replace(<DialogInspect part={props.part} />)
+dialog.replace(() => <DialogInspect part={props.part} />)
           },
         },
       ]}
@@ -51,10 +51,14 @@ export function DialogTool(props: { part: ToolPart }) {
 
 export function DialogInspect(props: { part: ToolPart }) {
   const dialog = useDialog()
-  const { theme } = useTheme()
+  const renderer = useRenderer()
+  const { theme, syntax } = useTheme()
   const dimensions = useTerminalDimensions()
 
-  onMount(() => dialog.setSize("large"))
+  onMount(() => {
+    renderer.clearSelection()
+    dialog.setSize("large")
+  })
 
   const json = createMemo(() => {
     const state = props.part.state
@@ -71,6 +75,10 @@ export function DialogInspect(props: { part: ToolPart }) {
     )
   })
 
+  const lineCount = createMemo(() => json().split("\n").length)
+  const maxLines = createMemo(() => Math.floor(dimensions().height * 0.5))
+  const needsScroll = createMemo(() => lineCount() + 2 > maxLines())
+
   return (
     <box paddingLeft={2} paddingRight={2} gap={1}>
       <box flexDirection="row" justifyContent="space-between">
@@ -81,9 +89,24 @@ export function DialogInspect(props: { part: ToolPart }) {
           esc
         </text>
       </box>
-      <scrollbox maxHeight={Math.floor(dimensions().height / 2)} paddingBottom={1}>
-        <text fg={theme.text}>{json()}</text>
-      </scrollbox>
+      <Show when={needsScroll()}>
+        <scrollbox height={maxLines()} scrollbarOptions={{ visible: false }}>
+          <box backgroundColor={theme.backgroundElement} paddingTop={1} paddingLeft={1} paddingRight={1}>
+            <line_number fg={theme.textMuted} minWidth={3} paddingRight={1}>
+              <code conceal={false} fg={theme.text} filetype="json" syntaxStyle={syntax()} content={json()} wrapMode="none" />
+            </line_number>
+            <box height={1} />
+          </box>
+        </scrollbox>
+      </Show>
+      <Show when={!needsScroll()}>
+        <box backgroundColor={theme.backgroundElement} paddingTop={1} paddingLeft={1} paddingRight={1}>
+          <line_number fg={theme.textMuted} minWidth={3} paddingRight={1}>
+            <code conceal={false} fg={theme.text} filetype="json" syntaxStyle={syntax()} content={json()} wrapMode="none" />
+          </line_number>
+          <box height={1} />
+        </box>
+      </Show>
     </box>
   )
 }
