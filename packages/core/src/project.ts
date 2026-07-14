@@ -30,6 +30,7 @@ export type Directories = typeof Directories.Type
 export interface Resolved {
   readonly previous?: ID
   readonly id: ID
+  readonly baseId?: ID
   readonly directory: AbsolutePath
   readonly vcs?: Vcs
 }
@@ -112,10 +113,12 @@ export const layer = Layer.effect(
       if (!repo) return { id: ID.global, directory: AbsolutePath.make(path.parse(input).root), vcs: undefined }
 
       const previous = yield* cached(repo.commonDirectory)
-      const id = (yield* remote(repo)) ?? previous ?? (yield* root(repo))
+      const baseId = (yield* remote(repo)) ?? previous ?? (yield* root(repo))
+      const id = baseId ? ID.make(Hash.fast(`worktree:${baseId}:${repo.worktree}`)) : ID.global
       return {
         previous,
-        id: id ?? ID.global,
+        id,
+        baseId: baseId ?? undefined,
         directory: repo.worktree,
         vcs: { type: "git" as const, store: repo.commonDirectory },
       }

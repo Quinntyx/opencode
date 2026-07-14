@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { and, eq, sql } from "drizzle-orm"
+import { and, eq, sql, like, or } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProjectDirectories } from "@opencode-ai/core/project/directories"
@@ -218,7 +218,31 @@ export const layer = Layer.effect(
 
       // Phase 2: upsert
       const projectID = ProjectV2.ID.make(data.id)
-      yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
+
+      // Migrate base repo ID format if the cached identity changed (e.g., root-commit → remote)
+      if (data.previous && data.baseId && data.previous !== data.baseId) {
+        yield* migrateProjectId(ProjectV2.ID.make(data.previous), ProjectV2.ID.make(data.baseId))
+      }
+
+      // Split sessions from repo-level project to this worktree (scoped by directory)
+      if (data.baseId && data.baseId !== projectID) {
+        const baseProjectID = ProjectV2.ID.make(data.baseId)
+        yield* db
+          .update(SessionTable)
+          .set({ project_id: projectID, time_updated: sql`${SessionTable.time_updated}` })
+          .where(
+            and(
+              eq(SessionTable.project_id, baseProjectID),
+              or(
+                eq(SessionTable.directory, data.directory),
+                like(SessionTable.directory, `${data.directory}/%`),
+              ),
+            ),
+          )
+          .run()
+          .pipe(Effect.orDie)
+      }
+
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
         ? fromRow(row)
@@ -304,7 +328,7 @@ export const layer = Layer.effect(
 
       yield* emitUpdated(result)
       if (projectID !== ProjectV2.ID.global && data.vcs?.type === "git") {
-        yield* projectV2.commit({ store: data.vcs.store, id: data.id })
+        yield* projectV2.commit({ store: data.vcs.store, id: ProjectV2.ID.make(data.baseId ?? data.id) })
       }
       return { project: result, sandbox: data.vcs ? data.directory : worktree }
     })

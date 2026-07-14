@@ -81,9 +81,6 @@ export const layer = Layer.effect(
 
       const source = yield* project.resolve(current.location.directory)
       const destination = yield* project.resolve(directory)
-      if (current.projectID !== destination.id) {
-        return yield* new DestinationProjectMismatchError({ expected: current.projectID, actual: destination.id })
-      }
 
       const moveChanges = input.moveChanges && source.directory !== destination.directory
       const sourceRepository = moveChanges ? yield* git.repo.discover(current.location.directory) : undefined
