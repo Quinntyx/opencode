@@ -25,7 +25,7 @@ import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA, MouseButton } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
@@ -48,6 +48,7 @@ import { useDialog } from "../../ui/dialog"
 import { DialogAlert } from "../../ui/dialog-alert"
 import { TodoItem } from "../../component/todo-item"
 import { DialogMessage } from "./dialog-message"
+import { DialogTool } from "./dialog-tool"
 import type { PromptInfo } from "../../component/prompt/history"
 import { DialogConfirm } from "../../ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
@@ -1841,6 +1842,7 @@ function InlineTool(props: {
   const ctx = use()
   const sync = useSync()
   const renderer = useRenderer()
+  const dialog = useDialog()
   const [hover, setHover] = createSignal(false)
   const [errorExpanded, setErrorExpanded] = createSignal(false)
 
@@ -1888,8 +1890,12 @@ function InlineTool(props: {
       separate={props.separate}
       onMouseOver={() => clickable() && setHover(true)}
       onMouseOut={() => setHover(false)}
-      onMouseUp={() => {
+      onMouseDown={(evt: { button: number }) => {
+        if (evt.button === MouseButton.RIGHT) dialog.replace(() => <DialogTool part={props.part} />)
+      }}
+      onMouseUp={(evt: { button: number }) => {
         if (renderer.getSelection()?.getSelectedText()) return
+        if (evt.button !== undefined && evt.button !== MouseButton.LEFT) return
         if (failed()) {
           setErrorExpanded((value) => !value)
           return
@@ -1919,13 +1925,15 @@ export function InlineToolRow(props: {
   children: JSX.Element
   onMouseOver?: () => void
   onMouseOut?: () => void
-  onMouseUp?: () => void
+  onMouseDown?: (evt: { button: number }) => void
+  onMouseUp?: (evt: { button: number }) => void
 }) {
   return (
     <box
       paddingLeft={3}
       onMouseOver={props.onMouseOver}
       onMouseOut={props.onMouseOut}
+      onMouseDown={props.onMouseDown}
       onMouseUp={props.onMouseUp}
       ref={(el: BoxRenderable) => {
         if (props.separate) alwaysSeparate.add(el)
@@ -1991,6 +1999,7 @@ function BlockTool(props: {
 }) {
   const { theme } = useTheme()
   const renderer = useRenderer()
+  const dialog = useDialog()
   const [hover, setHover] = createSignal(false)
   const error = createMemo(() => (props.part?.state.status === "error" ? props.part.state.error : undefined))
   return (
@@ -2007,8 +2016,14 @@ function BlockTool(props: {
       borderColor={theme.background}
       onMouseOver={() => props.onClick && setHover(true)}
       onMouseOut={() => setHover(false)}
-      onMouseUp={() => {
+      onMouseDown={(evt: { button: number }) => {
+        if (evt.button !== MouseButton.RIGHT) return
+        const part = props.part
+        if (part) dialog.replace(() => <DialogTool part={part} />)
+      }}
+      onMouseUp={(evt: { button: number }) => {
         if (renderer.getSelection()?.getSelectedText()) return
+        if (evt.button !== undefined && evt.button !== MouseButton.LEFT) return
         props.onClick?.()
       }}
     >
