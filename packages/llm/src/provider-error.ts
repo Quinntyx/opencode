@@ -9,6 +9,7 @@ const patterns = [
   /maximum prompt length is \d+/i,
   /reduce the length of the messages/i,
   /maximum context length is \d+ tokens/i,
+  /maximum context length.*plan is \d+ tokens/i,
   /exceeds the limit of \d+/i,
   /exceeds the available context size/i,
   /greater than the context length/i,

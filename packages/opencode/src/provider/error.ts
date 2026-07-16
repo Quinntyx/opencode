@@ -102,9 +102,18 @@ export type ParsedStreamError =
 export function parseStreamError(input: unknown): ParsedStreamError | undefined {
   const raw = json(input)
   const body = typeof raw?.message === "string" ? (json(raw.message) ?? raw) : raw
-  if (!body) return
+  if (!body) {
+    if (typeof input === "string" && isContextOverflow(input)) {
+      return { type: "context_overflow", message: input, responseBody: input }
+    }
+    return
+  }
 
   const responseBody = JSON.stringify(body)
+  const msg = typeof body?.error === "string" ? body.error : typeof body?.message === "string" ? body.message : responseBody
+  if (isContextOverflow(msg)) {
+    return { type: "context_overflow", message: msg, responseBody }
+  }
   if (body.type !== "error") return
 
   switch (body?.error?.code) {
